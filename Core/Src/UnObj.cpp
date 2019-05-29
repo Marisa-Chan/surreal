@@ -1,9 +1,16 @@
 #include "Core.h"
+#include "UnLinker.h"
+#include "UnArUtil.h"
 
 //Local
 static UBOOL GNoGC = false;
+static UBOOL GCheckConflicts = 0;
+static UBOOL GExitPurge = 0;
 static INT GGarbageRefCount = 0;
-static INT GExitPurge = 0;
+static DOUBLE GTempDouble = 0.0;
+static INT GNativeDuplicate = 0;
+static ULinkerSave *GTempSave = NULL;
+
 
 //Static
 UBOOL				UObject::GObjInitialized;	// Whether initialized.
@@ -24,7 +31,8 @@ TArray<UObject*>	UObject::GObjRegistrants;		// Registrants during ProcessRegistr
 TArray<FPreferencesInfo>	UObject::GObjPreferences; // Prefereces cache.
 TArray<FRegistryObjectInfo> UObject::GObjDrivers; // Drivers cache.
 TMultiMap<FName,FName>*		UObject::GObjPackageRemap; // Remap table for loading renamed packages.
-TCHAR				UObject::GLanguage[64];
+TCHAR				UObject::GLanguage[64] = TEXT("int");
+
 
 
 
@@ -72,7 +80,7 @@ void UObject::UnhashObject( INT OuterIndex )
     guard(UObject::UnhashObject);
 
     INT Removed = 0;
-    UObject **ppobj = &GObjHash[ (Name.GetIndex() ^ OuterIndex) & 0xFFF ];
+    UObject **ppobj = &GObjHash[ GetObjectHash(Name, OuterIndex) ];
 
     while ( *ppobj )
     {
@@ -415,7 +423,7 @@ void UObject::CacheDrivers( UBOOL ForceRefresh )
 
         tmp1 = FString(".") + tmp1;
 
-        if ( !appStricmp(*tmp1, TEXT(".dll")) || !appStricmp(*tmp1, TEXT(".u")) || !appStricmp(*tmp1, TEXT(".ilk")) )
+        if ( !appStricmp(*tmp1, DLLEXT) || !appStricmp(*tmp1, TEXT(".u")) || !appStricmp(*tmp1, TEXT(".ilk")) )
         {
             FRegistryObjectInfo *freg = new(GObjDrivers) FRegistryObjectInfo;
             freg->Object = appStrstr(*files(i), TEXT(".")) + 1;
@@ -1013,7 +1021,7 @@ UBOOL UObject::ScriptConsoleExec( const TCHAR* Cmd, FOutputDevice& Ar, UObject* 
 
         ParseNext(&Cmd);
 
-        Cmd = It->ImportText(Cmd, &tmp[It->Offset], 1);
+        Cmd = It->ImportText(Cmd, &tmp[It->Offset], PPF_Localized);
 
         if ( !Cmd )
         {
@@ -1388,7 +1396,7 @@ void UObject::SaveConfig( DWORD Flags, const TCHAR* InFilename )
 
     if ( !Filename )
     {
-        if ( PerObject && Outer != GObjTransientPkg )
+        if ( PerObject && Outer != UObject::GetTransientPackage() )
             Filename = *(Outer->Name);
         else
             Filename = *(Class->ClassConfigName);
@@ -1506,7 +1514,7 @@ void UObject::LoadConfig( UBOOL Propagate, UClass* InClass, const TCHAR* InFilen
         const TCHAR *Filename = InFilename;
         if ( !Filename )
         {
-            if ( PerObject && Outer != GObjTransientPkg )
+            if ( PerObject && Outer != UObject::GetTransientPackage() )
                 Filename = *(Outer->Name);
             else
                 Filename = *(InClass->ClassConfigName);
@@ -1730,3 +1738,1949 @@ void UObject::ParseParms( const TCHAR* Parms )
 
     unguard;
 }
+
+
+
+UObject* UObject::StaticFindObject( UClass* ObjectClass, UObject* InObjectPackage, const TCHAR* InName, UBOOL ExactClass )
+{
+    guard(UObject::StaticFindObject);
+
+    UObject *ObjectPackage;
+    if ( InObjectPackage == (UObject *)-1 )
+        ObjectPackage = NULL;
+    else
+        ObjectPackage = InObjectPackage;
+
+    if ( !ResolveName(ObjectPackage, InName, false, false) )
+        return NULL;
+
+    FName ObjectName(InName, FNAME_Find);
+
+    if ( ObjectName == NAME_None )
+        return NULL;
+
+    for ( UObject *i = GObjHash[ GetObjectHash(ObjectName, GetTypeHash(ObjectPackage)) ]; i; i = i->HashNext )
+    {
+        if ( i->Name == ObjectName && i->Outer == ObjectPackage )
+        {
+            if ( !ObjectClass )
+                return i;
+            else
+            {
+                if ( ExactClass )
+                {
+                    if ( i->Class == ObjectClass )
+                        return i;
+                }
+                else
+                {
+                    if ( i->IsA(ObjectClass) )
+                        return i;
+                }
+            }
+
+        }
+    }
+
+    if ( InObjectPackage == (UObject *)-1 )
+    {
+        for (TObjectIterator<UObject> It; It; ++It)
+        {
+            if ( It->Name == ObjectName )
+            {
+                if ( !ObjectClass )
+                    return *It;
+                else
+                {
+                    if ( ExactClass )
+                    {
+                        if ( It->Class == ObjectClass )
+                            return *It;
+                    }
+                    else
+                    {
+                        if ( It->IsA(ObjectClass) )
+                            return *It;
+                    }
+                }
+            }
+        }
+    }
+
+    return NULL;
+    unguard;
+}
+
+
+UObject* UObject::StaticFindObjectChecked( UClass* InClass, UObject* InOuter, const TCHAR* InName, UBOOL ExactClass )
+{
+    guard(UObject::StaticLoadObject);
+
+    UObject *Result = StaticFindObject(InClass, InOuter, InName, ExactClass);
+
+    if ( !Result )
+    {
+        const TCHAR *rsn;
+
+        if ( InOuter == (UObject *)-1 )
+        {
+            rsn = TEXT("Any");
+        }
+        else if ( InOuter )
+        {
+            rsn = *(InOuter->Name);
+        }
+        else
+        {
+            rsn = TEXT("None");
+        }
+
+        appErrorf( LocalizeError("ObjectNotFound", TEXT("Core")), *(InClass->Name), rsn, InName );
+    }
+
+    return Result;
+
+    unguard;
+}
+
+
+UObject* UObject::StaticLoadObject( UClass* ObjectClass, UObject* InOuter, const TCHAR* InName, const TCHAR* Filename, DWORD LoadFlags, UPackageMap* Sandbox )
+{
+    guard(UObject::StaticLoadObject);
+
+    check( ObjectClass );
+    check( InName );
+
+    ULinkerLoad *Loader = NULL;
+    UObject* Result = NULL;
+
+    BeginLoad();
+
+    ResolveName(InOuter, InName, true, true);
+
+    while ( InOuter && InOuter->Outer )
+        InOuter = InOuter->GetOuter();
+
+    if ( !(LoadFlags & LOAD_DisallowFiles) )
+        Loader = GetPackageLinker(InOuter, Filename, LoadFlags | (LOAD_AllowDll | LOAD_Throw), Sandbox, NULL);
+
+    if ( Loader )
+        Result = Loader->Create(ObjectClass, InName, LoadFlags, false);
+
+    if ( !Result )
+    {
+        Result = StaticFindObject(ObjectClass, InOuter, InName);
+
+        if ( !Result )
+            appThrowf(LocalizeError("ObjectNotFound", TEXT("Core")), *(ObjectClass->Name), (InOuter ? InOuter->GetPathName() : TEXT("None")), *InName);
+    }
+    UObject::EndLoad();
+    return Result;
+
+    unguard;
+}
+
+
+UClass* UObject::StaticLoadClass( UClass* BaseClass, UObject* InOuter, const TCHAR* Name, const TCHAR* Filename, DWORD LoadFlags, UPackageMap* Sandbox )
+{
+    guard(UObject::StaticLoadClass);
+
+    check(BaseClass);
+
+    UClass *Class = LoadObject<UClass>( InOuter, Name, Filename, LoadFlags | LOAD_Throw, Sandbox );
+
+    if (Class && !Class->IsChildOf(BaseClass))
+        appThrowf(LocalizeError("LoadClassMismatch", TEXT("Core")), Class->GetFullName(), BaseClass->GetFullName());
+
+    return Class;
+
+    unguard;
+}
+
+
+UObject* UObject::StaticAllocateObject( UClass* InClass, UObject* InOuter, FName InName, DWORD InSetFlags, UObject* Template, FOutputDevice* Error, UObject* Ptr )
+{
+    guard(UObject::StaticAllocateObject);
+
+    check(Error);
+
+    if ( !InClass )
+    {
+        Error->Logf(TEXT("Empty class for object %s"), *InName);
+        return NULL;
+    }
+
+    check( !InClass || InClass->ClassWithin );
+    check( !InClass || InClass->ClassConstructor );
+
+    if ( InClass->Index == INDEX_NONE && GObjRegisterCount == 0 )
+    {
+        Error->Logf(TEXT("Unregistered class for %s"), *InName);
+        return NULL;
+    }
+
+    if ( InClass->ClassFlags & CLASS_Abstract )
+    {
+        Error->Logf(LocalizeError("Abstract", TEXT("Core")), *InName, *(InClass->Name) );
+        return NULL;
+    }
+
+    if ( InOuter )
+    {
+        if ( !InOuter->IsA( InClass->ClassWithin ) )
+        {
+            if ( InClass->ClassWithin )
+            {
+                Error->Logf(LocalizeError("NotWithin", TEXT("Core")), *(InClass->Name), *InName, *(InOuter->Class->Name), *(InClass->ClassWithin->Name) );
+                return NULL;
+            }
+        }
+    }
+    else if ( InClass != UPackage::StaticClass() )
+    {
+        Error->Logf(LocalizeError("NotPackaged", TEXT("Core")), *(InClass->Name), *InName);
+        return NULL;
+    }
+
+    if ( InName == NAME_None )
+        InName = MakeUniqueObjectName(InOuter, InClass);
+
+    if ( GCheckConflicts && InName != NAME_None )
+    {
+        for (UObject *i = GObjHash[ GetObjectHash(InName, GetTypeHash(InOuter)) ]; i; i = i->HashNext )
+        {
+            if ( i->Name == InName && i->Outer == InOuter && i->Class != InClass )
+                GLog->Logf(NAME_Log, TEXT("CONFLICT: %s - %s"), i->GetFullName(), *(InClass->Name));
+        }
+    }
+
+    UObject *Obj = StaticFindObject( InClass, InOuter, *InName, false);
+    UClass *Cls = Cast<UClass>(Obj);
+    INT Index = INDEX_NONE;
+    UClass *ClassWithin = NULL;
+    DWORD ClassFlags = 0;
+    void(*ClassConstructor)(void*) = NULL;
+
+    if ( Obj )
+    {
+        check( !Ptr || Ptr==Obj );
+
+        debugfSlow(NAME_DevReplace, TEXT("Replacing %s"), *(Obj->Name) );
+
+        if ( Obj->Class != InClass )
+            appErrorf( LocalizeError("NoReplace", TEXT("Core")), Obj->GetFullName(), *(InClass->Name) );
+
+        InSetFlags |= Obj->ObjectFlags & (RF_Marked|RF_Native);
+
+        Index = Obj->Index;
+
+        if ( Cls )
+        {
+            ClassFlags = Cls->ClassFlags & CLASS_Abstract;
+            ClassWithin = Cls->ClassWithin;
+            ClassConstructor = Cls->ClassConstructor;
+        }
+
+        Obj->~UObject();
+
+        check( GObjAvailable.Num() && GObjAvailable.Last()==Index );
+
+        GObjAvailable.Pop();
+    }
+    else
+    {
+        Obj = Ptr;
+
+        if ( !Obj )
+            Obj = (UObject *)::operator new(InClass->GetPropertiesSize(), *InName); //CHECKIT
+    }
+
+    if ( InClass->ClassFlags & CLASS_Transient )
+        InSetFlags |= RF_Transient;
+
+    Obj->Index = INDEX_NONE;
+    Obj->_LinkerIndex = INDEX_NONE;
+    Obj->HashNext = NULL;
+    Obj->StateFrame = NULL;
+    Obj->_Linker = NULL;
+    Obj->Outer = InOuter;
+    Obj->Name = InName;
+    Obj->ObjectFlags = InSetFlags;
+    Obj->Class = InClass;
+
+    InitProperties((BYTE *)Obj, InClass->GetPropertiesSize(), InClass, (BYTE *)Template, InClass->GetPropertiesSize());
+
+    Obj->AddObject(Index);
+
+    check( !Obj->IsValid() );
+
+    if ( InClass->ClassFlags & CLASS_PerObjectConfig )
+    {
+        Obj->LoadConfig();
+        Obj->LoadLocalized();
+    }
+
+    if ( Cls )
+    {
+        Cls->ClassWithin = ClassWithin;
+        Cls->ClassFlags |= ClassFlags;
+        Cls->ClassConstructor = ClassConstructor;
+    }
+
+    return Obj;
+
+    unguard;
+}
+
+
+UObject* UObject::StaticConstructObject( UClass* Class, UObject* InOuter, FName Name, DWORD SetFlags, UObject* Template, FOutputDevice* Error )
+{
+    guard(UObject::StaticConstructObject);
+
+    check(Error);
+    UObject *Result = StaticAllocateObject(Class, InOuter, Name, SetFlags, Template, Error, NULL);
+
+    if (Result)
+        Class->ClassConstructor(Result);
+
+    return Result;
+    unguard;
+}
+
+
+void UObject::StaticInit()
+{
+    guard(UObject::StaticInit);
+
+    GObjNoRegister = true;
+    GCheckConflicts = ParseParam(appCmdLine(), TEXT("CONFLICTS"));
+    GNoGC = ParseParam(appCmdLine(), TEXT("NOGC"));
+
+    for (INT i = 0; i < 4096; ++i )
+        GObjHash[i] = NULL;
+
+    GObjInitialized = true;
+    ProcessRegistrants();
+
+    GObjTransientPkg = new(NULL, TEXT("Transient"), 0) UPackage();
+
+    GObjTransientPkg->AddToRoot();
+
+    GObjPackageRemap = new TMultiMap<FName,FName>;
+
+    GObjPackageRemap->Add(TEXT("UnrealI"), TEXT("UnrealShare"));
+
+    GLog->Logf(NAME_Init, TEXT("Object subsystem initialized"));
+
+    unguard;
+}
+
+
+void UObject::StaticExit()
+{
+    guard(UObject::StaticExit);
+
+    check(GObjLoaded.Num() == 0);
+    check(GObjRegistrants.Num() == 0);
+    check(!GAutoRegister);
+
+    GObjTransientPkg->RemoveFromRoot();
+
+    for (TObjectIterator<UObject> It; It; ++It)
+        It->ObjectFlags |= RF_TagGarbage | RF_Unreachable;
+
+    for (INT i = 0; i < FName::GetMaxNames(); ++i )
+    {
+        FNameEntry* N = FName::GetEntry(i);
+        if ( N )
+            N->Flags |= RF_Unreachable;
+    }
+
+    GExitPurge = true;
+
+    PurgeGarbage();
+
+    GObjObjects.Empty();
+    GObjLoaded.Empty();
+    GObjObjects.Empty();
+    GObjAvailable.Empty();
+    GObjLoaders.Empty();
+    GObjRoot.Empty();
+    GObjRegistrants.Empty();
+    GObjPreferences.Empty();
+    GObjDrivers.Empty();
+
+    if ( GObjPackageRemap )
+    {
+        GObjPackageRemap->Empty();
+        delete GObjPackageRemap;
+    }
+
+    GObjInitialized = false;
+
+    GLog->Logf(NAME_Exit, TEXT("Object subsystem successfully closed."));
+
+    unguard;
+}
+
+
+
+static void ShowClasses(UClass *Class, FOutputDevice &Ar, INT Indent)
+{
+    Ar.Logf(TEXT("%s%s"), appSpc(Indent), Class->GetName());
+
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        if (It->GetSuperClass() == Class)
+            ShowClasses(*It, Ar, Indent + 2);
+    }
+}
+
+
+UBOOL UObject::StaticExec( const TCHAR* Cmd, FOutputDevice& Ar )
+{
+    guard(UObject::StaticExec);
+
+    if ( ParseCommand(&Cmd, TEXT("MEM")) )
+    {
+        GMalloc->DumpAllocs();
+    }
+    else if ( ParseCommand(&Cmd, TEXT("DUMPNATIVES")) )
+    {
+        for (INT i = 0; i < 4096; ++i )
+        {
+            if ( GNatives[i] == &UObject::execUndefined )
+                GLog->Logf(TEXT("Native index %i is available"), i);
+        }
+    }
+    else if ( ParseCommand(&Cmd, TEXT("GET")) )
+    {
+        TCHAR ClassName[256];
+        TCHAR PropertyName[256];
+
+        if ( !ParseToken(Cmd, ClassName, 256, true) )
+        {
+            Ar.Logf(NAME_ExecWarning, TEXT("Unrecognized class %s"), ClassName);
+            return true;
+        }
+
+        UClass *Cls = FindObject<UClass>((UObject *)-1, ClassName, false);
+        if (!Cls)
+        {
+            Ar.Logf(NAME_ExecWarning, TEXT("Unrecognized class %s"), ClassName);
+            return true;
+        }
+
+        if ( !ParseToken(Cmd, PropertyName, 256, true) )
+        {
+            Ar.Logf(NAME_ExecWarning, TEXT("Unrecognized property %s"), PropertyName);
+            return true;
+        }
+
+        UProperty *Prop = FindField<UProperty>(Cls, PropertyName);
+        if (!Prop)
+        {
+            Ar.Logf(NAME_ExecWarning, TEXT("Unrecognized property %s"), PropertyName);
+            return true;
+        }
+
+        TCHAR Buff[256];
+        appMemset(Buff, 0, sizeof(Buff));
+
+        if (Cls->Defaults.Num())
+            Prop->ExportText(0, Buff, (BYTE *)Cls->Defaults.GetData(), (BYTE *)Cls->Defaults.GetData(), PPF_Localized);
+
+        Ar.Log(Buff);
+    }
+    else if ( ParseCommand(&Cmd, TEXT("SET")) )
+    {
+        TCHAR ClassName[256];
+        TCHAR PropertyName[256];
+
+        if ( !ParseToken(Cmd, ClassName, 256, true) )
+        {
+            Ar.Logf(NAME_ExecWarning, TEXT("Unrecognized class %s"), ClassName);
+            return true;
+        }
+
+        UClass *Cls = FindObject<UClass>((UObject *)-1, ClassName, false);
+        if (!Cls)
+        {
+            Ar.Logf(NAME_ExecWarning, TEXT("Unrecognized class %s"), ClassName);
+            return true;
+        }
+
+        if ( !ParseToken(Cmd, PropertyName, 256, true) )
+        {
+            Ar.Logf(NAME_ExecWarning, TEXT("Unrecognized property %s"), PropertyName);
+            return true;
+        }
+
+        UProperty *Prop = FindField<UProperty>(Cls, PropertyName);
+        if (!Prop)
+        {
+            Ar.Logf(NAME_ExecWarning, TEXT("Unrecognized property %s"), PropertyName);
+            return true;
+        }
+
+        while(Cmd[0] == ' ')
+            ++Cmd;
+
+        GlobalSetProperty(Cmd, Cls, Prop, Prop->Offset, true);
+    }
+    else if ( !ParseCommand(&Cmd, TEXT("OBJ")) )
+    {
+        if ( !ParseCommand(&Cmd, TEXT("GTIME")) )
+            return false;
+
+        GLog->Logf(TEXT("GTime = %f"), GTempTime);
+    }
+    else if ( ParseCommand(&Cmd, TEXT("GARBAGE")) )
+    {
+        UBOOL tmp = GNoGC;
+        GNoGC = false;
+
+        CollectGarbage((GIsEditor ? RF_Standalone : 0) | RF_Native);
+
+        GNoGC = tmp;
+    }
+    else if ( ParseCommand(&Cmd, TEXT("MARK")) )
+    {
+        GLog->Logf(TEXT("Marking objects"));
+
+        for (TObjectIterator<UObject> It; It; ++It)
+            It->ObjectFlags |= RF_Marked;
+    }
+    else if ( ParseCommand(&Cmd, TEXT("MARKCHECK")) )
+    {
+        GLog->Logf(TEXT("Unmarked objects:"));
+
+        for (TObjectIterator<UObject> It; It; ++It)
+        {
+            if ( !(It->ObjectFlags & RF_Marked) )
+                GLog->Logf(TEXT("%s"), It->GetFullName());
+        }
+    }
+    else if ( ParseCommand(&Cmd, TEXT("REFS")) )
+    {
+        UClass *ObjClass;
+        UObject *Object;
+
+        if ( !ParseObject<UClass>(Cmd, TEXT("CLASS="), ObjClass, (UObject *)-1)
+                || !ParseObject(Cmd, TEXT("NAME="), ObjClass, Object, (UObject *)-1) )
+        {
+            return true;
+        }
+
+        Ar.Logf(TEXT(""));
+        Ar.Logf(TEXT("Referencers of %s:"), Object->GetFullName());
+
+        for (TObjectIterator<UObject> It; It; ++It)
+        {
+            FArchiveFindCulprit Culprit(Object);
+
+            It->Serialize(Culprit);
+
+            if (Culprit.GetCount())
+                Ar.Logf(TEXT("   %s"), It->GetFullName());
+        }
+
+        Ar.Logf(TEXT(""));
+        Ar.Logf(TEXT("Shortest reachability from root to %s:"), Object->GetFullName());
+
+        TArray<UObject*> Route = FArchiveTraceRoute::FindShortestRootPath(Object);
+        for(INT i = 0; i < Route.Num(); ++i)
+        {
+            if ( i == 0 )
+            {
+                if ( Route(i)->GetFlags() & RF_Native )
+                    Ar.Logf(TEXT("   %s%s"), Route(i)->GetFullName(), TEXT(" (native)"));
+                else
+                    Ar.Logf(TEXT("   %s%s"), Route(i)->GetFullName(), TEXT(" (root)"));
+            }
+            else
+            {
+                Ar.Logf(TEXT("   %s%s"), Route(i)->GetFullName(), TEXT(""));
+            }
+        }
+
+        if ( !Route.Num() )
+            Ar.Logf(TEXT("   (Object is not currently rooted)"));
+    }
+    else if ( ParseCommand(&Cmd, TEXT("HASH")) )
+    {
+        FName::DisplayHash(Ar);
+
+        /*INT Objs = 0;
+        for (TObjectIterator<UObject> It; It; ++It)
+        {
+        	++Objs;
+        }
+
+        INT Hsh = 0;
+        for (INT i = 0; i < 4096; ++i)
+        {
+        	INT Chain = 0;
+        	UObject *H = GObjHash[i];
+        	while (H)
+        	{
+        		H = H->HashNext;
+        		Chain++;
+        	}
+
+        	if (Chain)
+        		++Hsh;
+        }*/
+    }
+    else if ( ParseCommand(&Cmd, TEXT("CLASSES")) )
+    {
+        ShowClasses(UObject::StaticClass(), Ar, 0);
+    }
+    else if ( ParseCommand(&Cmd, TEXT("DEPENDENCIES")) )
+    {
+        UPackage *Pkg;
+        if ( ParseObject<UPackage>(Cmd, TEXT("PACKAGE="), Pkg, NULL) )
+        {
+            TArray<UObject*> Exclude;
+            for (INT i = 0; i < 16; ++i )
+            {
+                TCHAR Buf[16];
+                appSprintf(Buf, TEXT("EXCLUDE%i="), i);
+
+                FName N;
+                if ( Parse(Cmd, Buf, N) )
+                    Exclude( Exclude.Add() ) = UObject::CreatePackage(NULL, *N);
+            }
+
+            Ar.Logf(TEXT("Dependencies of %s:"), Pkg->GetPathName());
+
+            for (TObjectIterator<UObject> It; It; ++It)
+            {
+                if (It->GetOuter() == Pkg)
+                {
+                    FArchiveShowReferences ShowRef(Ar, Pkg, *It, Exclude);
+
+                    It->Serialize(ShowRef);
+                }
+            }
+        }
+    }
+    else if ( ParseCommand(&Cmd, TEXT("LIST")) )
+    {
+        Ar.Log(TEXT("Objects:"));
+        Ar.Log(TEXT(""));
+
+        UClass *CheckType = NULL;
+        UPackage *CheckPackage = NULL;
+        UPackage *InsidePackage = NULL;
+
+        ParseObject<UClass>(Cmd, TEXT("CLASS="), CheckType, (UObject *)-1);
+        ParseObject<UPackage>(Cmd, TEXT("PACKAGE="), CheckPackage, NULL);
+        ParseObject<UPackage>(Cmd, TEXT("INSIDE="), InsidePackage, NULL);
+
+        struct FItem
+        {
+            UClass*		Class;
+            INT			Count;
+            SIZE_T		Num;
+            SIZE_T		Max;
+
+            FItem()
+                : Class		( NULL )
+                , Count		( 0 )
+                , Num		( 0 )
+                , Max		( 0 )
+            {}
+
+            static QSORT_RETURN CDECL QCompare( const void* _a, const void* _b )
+            {
+                const FItem *a = (const FItem *)_a;
+                const FItem *b = (const FItem *)_b;
+
+                return b->Max - a->Max;
+            }
+        };
+
+        struct FSubItem
+        {
+            UObject*	Object;
+            SIZE_T		Num;
+            SIZE_T		Max;
+
+            FSubItem()
+                : Object	( NULL )
+                , Num		( 0 )
+                , Max		( 0 )
+            {}
+
+            static QSORT_RETURN CDECL QCompare( const void* _a, const void* _b )
+            {
+                const FSubItem *a = (const FSubItem *)_a;
+                const FSubItem *b = (const FSubItem *)_b;
+
+                INT Res = b->Max - a->Max;
+                if (Res)
+                    return Res;
+
+                Res = appStrcmp(a->Object->GetClass()->GetName(), b->Object->GetClass()->GetName());
+                if (Res)
+                    return Res;
+
+                Res = appAtoi(a->Object->GetName() + appStrlen(a->Object->GetClass()->GetName()))
+                      - appAtoi(b->Object->GetName() + appStrlen(b->Object->GetClass()->GetName()));
+                return Res;
+            }
+        };
+
+        TArray<FItem> List;
+        TArray<FSubItem> Objects;
+        FItem Total;
+
+        for (TObjectIterator<UObject> It; It; ++It)
+        {
+            if ( (CheckType && It->IsA(CheckType)) ||
+                    (CheckPackage && It->GetOuter() == CheckPackage) ||
+                    (InsidePackage && It->IsIn(InsidePackage)) )
+            {
+                FArchiveCountMem Count;
+                It->Serialize(Count);
+
+                FItem *Found = NULL;
+                for (INT i = 0; i < List.Num(); ++i)
+                {
+                    if (List(i).Class == It->GetClass())
+                    {
+                        Found = &List(i);
+                        break;
+                    }
+                }
+
+                if (!Found)
+                {
+                    Found = new(List) FItem();
+                    if ( Found )
+                        Found->Class = It->GetClass();
+                }
+
+                //if ( CheckType || CheckPackage || InsidePackage )
+                {
+                    FSubItem * Itm = new(Objects) FSubItem();
+                    if ( Itm )
+                    {
+                        Itm->Object = *It;
+                        Itm->Num = Count.GetNum();
+                        Itm->Max = Count.GetMax();
+                    }
+                }
+
+                ++Found->Count;
+                Found->Num += Count.GetNum();
+                Found->Max = Count.GetMax();
+
+                ++Total.Count;
+                Total.Num += Count.GetNum();
+                Total.Max += Count.GetMax();
+            }
+        }
+
+        INT DeletedObjects = 0;
+
+        if (Objects.Num())
+        {
+            appQsort(Objects.GetData(), Objects.Num(), sizeof(FSubItem), FSubItem::QCompare);
+
+            Ar.Log(TEXT(" "));
+            Ar.Logf(TEXT("%-78s %10s %10s"), TEXT("Object"), TEXT("NumBytes"), TEXT("MaxBytes"));
+            UBOOL Verbose = ParseCommand(&Cmd, TEXT("VERBOSE"));
+
+            for (INT i = 0; i < Objects.Num(); ++i )
+            {
+                if ( Verbose || !Objects(i).Object->IsPendingKill() )
+                {
+                    if ( !Objects(i).Object->IsPendingKill() )
+                        Ar.Logf(TEXT("%-78s %10i %10i %s"), Objects(i).Object->GetFullName(), Objects(i).Num, Objects(i).Max, TEXT(" "));
+                    else
+                        Ar.Logf(TEXT("%-78s %10i %10i %s"), Objects(i).Object->GetFullName(), Objects(i).Num, Objects(i).Max, TEXT("X"));
+                }
+
+                if ( Objects(i).Object->IsPendingKill() )
+                    ++DeletedObjects;
+            }
+            Ar.Log(TEXT(" "));
+        }
+
+        if ( List.Num() )
+        {
+            appQsort(List.GetData(), List.Num(), sizeof(FItem), FItem::QCompare);
+
+            Ar.Logf(TEXT("%-30s %6s %10s %10s"), TEXT("Class"), TEXT("Count"), TEXT("NumKBytes"), TEXT("MaxKBytes"));
+
+            for (INT i = 0; i < List.Num(); ++i )
+                Ar.Logf(TEXT("%-30s %6i %10i %10i"), List(i).Class->GetName(), List(i).Count, List(i).Num / 1024, List(i).Max /1024);
+
+            Ar.Log(TEXT(" "));
+        }
+
+        Ar.Logf(TEXT("%i Objects (%.3fM / %.3fM)"), Total.Count, Total.Num / 1048576.0, Total.Max / 1048576.0);
+        Ar.Logf(TEXT("%i Deleted Objects"), DeletedObjects);
+    }
+    else if ( ParseCommand(&Cmd, TEXT("VFHASH")) )
+    {
+        Ar.Logf(TEXT("Class VfHashes:"));
+
+        for (TObjectIterator<UState> It; It; ++It)
+        {
+            Ar.Logf(TEXT("%s:"), It->GetName());
+            for (INT i = 0; i < 256; ++i )
+            {
+                INT Cnt = 0;
+                UField *Hsh = It->VfHash[i];
+                while ( Hsh )
+                {
+                    Hsh = Hsh->HashNext;
+                    ++Cnt;
+                }
+                Ar.Logf(TEXT("   %i: %i"), i, Cnt);
+            }
+        }
+    }
+    else if ( ParseCommand(&Cmd, TEXT("LINKERS")) )
+    {
+        Ar.Logf(TEXT("Linkers:"));
+
+        for(INT i = 0; i < GObjLoaders.Num(); ++i)
+        {
+            ULinkerLoad* Loder = CastChecked<ULinkerLoad>( GObjLoaders(i) );
+
+            INT NameSz = 0;
+            for (INT j = 0; j < Loder->NameMap.Num(); ++j)
+                NameSz += sizeof(TCHAR) * appStrlen( *(Loder->NameMap(j)) ) + 14; //sizeof???
+
+            Ar.Logf(TEXT("%s (%s): Names=%i (%iK/%iK) Imports=%i (%iK) Exports=%i (%iK) Gen=%i Lazy=%i"),
+                    *(Loder->Filename),
+                    Loder->LinkerRoot->GetFullName(),
+                    Loder->NameMap.Num(),
+                    Loder->NameMap.Num() * sizeof(FName)  / 1024, //CHECKIT
+                    NameSz / 1024,
+                    Loder->ImportMap.Num(),
+                    Loder->ImportMap.Num() * sizeof(FObjectImport) / 1024,
+                    Loder->ExportMap.Num(),
+                    Loder->ExportMap.Num() * sizeof(FObjectExport) / 1024,
+                    Loder->Summary.Generations.Num(),
+                    Loder->LazyLoaders.Num());
+        }
+    }
+    else
+        return false;
+
+    return true;
+    unguard;
+}
+
+
+void UObject::StaticTick()
+{
+    guard(UObject::StaticTick);
+
+    check(GObjBeginLoadCount == 0);
+
+    if ( GNativeDuplicate )
+        appErrorf(TEXT("Duplicate native registered: %i"), GNativeDuplicate);
+
+    unguard;
+}
+
+
+UObject* UObject::LoadPackage( UObject* InOuter, const TCHAR* InFilename, DWORD LoadFlags )
+{
+    guard(UObject::LoadPackage);
+    BeginLoad();
+
+    if ( !InFilename )
+        InFilename = InOuter->GetName();
+
+    ULinkerLoad *Linker = GetPackageLinker(InOuter, InFilename, LoadFlags | LOAD_Throw, NULL, NULL);
+
+    if ( !(LoadFlags & LOAD_Verify) )
+        Linker->LoadAllObjects();
+
+    EndLoad();
+
+    return Linker->LinkerRoot;
+    unguard;
+}
+
+
+
+static QSORT_RETURN CDECL LinkerNameSort( const void* _a, const void* _b )
+{
+    FName *a = (FName *)_a;
+    FName *b = (FName *)_b;
+
+    return GTempSave->MapName(b) - GTempSave->MapName(a);
+}
+
+static QSORT_RETURN CDECL LinkerImportSort( const void* _a, const void* _b )
+{
+    const FObjectImport *a = (const FObjectImport *)_a;
+    const FObjectImport *b = (const FObjectImport *)_b;
+
+    return GTempSave->MapObject(b->XObject) - GTempSave->MapObject(a->XObject);
+}
+
+static QSORT_RETURN CDECL LinkerExportSort( const void* _a, const void* _b )
+{
+    const FObjectExport *a = (const FObjectExport *)_a;
+    const FObjectExport *b = (const FObjectExport *)_b;
+
+    return GTempSave->MapObject(b->_Object) - GTempSave->MapObject(a->_Object);
+}
+
+UBOOL UObject::SavePackage( UObject* InOuter, UObject* Base, DWORD TopLevelFlags, const TCHAR* Filename, FOutputDevice* Error, ULinkerLoad* Conform )
+{
+    guard(UObject::SavePackage);
+
+    DWORD TStart = appCycles();
+
+    check(InOuter);
+    check(Filename);
+
+    UPackage *P = Cast<UPackage>(InOuter);
+    if (P)
+        P->PackageFlags |= PKG_AllowDownload;
+
+    TCHAR TempFilename[256];
+
+    appStrcpy(TempFilename, Filename);
+    for (INT i = appStrlen(TempFilename); i > 0; --i )
+    {
+        TCHAR C = TempFilename[ i - 1 ];
+        if ( C == '\\' || C == '/' || C == ':' )
+        {
+            TempFilename[i] = 0;
+            break;
+        }
+    }
+
+    appStrcat(TempFilename, TEXT("Save.tmp"));
+
+    GWarn->StatusUpdatef(0, 0, LocalizeProgress("Saving", TEXT("Core")), Filename);
+
+    for (TObjectIterator<UObject> It; It; ++It)
+        It->ClearFlags(RF_LoadContextFlags | RF_TagImp | RF_TagExp);
+
+    for (INT i = 0; i < FName::GetMaxNames(); ++i)
+        FName::GetEntry(i)->Flags &= ~(RF_LoadContextFlags | RF_TagImp | RF_TagExp);
+
+    FArchiveSaveTagExports Exp(InOuter);
+
+    for (TObjectIterator<UObject> It; It; ++It)
+    {
+        if ( (It->GetFlags() & TopLevelFlags) && It->IsIn(InOuter) )
+        {
+            UObject* Tmp = *It;
+            Exp << Tmp;
+        }
+    }
+
+    ULinkerSave* ULSave = new ULinkerSave(InOuter, TempFilename);
+
+    for (TObjectIterator<UObject> It; It; ++It)
+    {
+        if ( It->GetFlags() & RF_TagExp )
+        {
+            FArchiveSaveTagImports Imp( It->GetFlags() & RF_LoadContextFlags, ULSave );
+
+            It->Serialize(Imp);
+            UClass *Cls = It->GetClass();
+            Imp << Cls;
+
+            if ( It->IsIn( UObject::GetTransientPackage() ))
+                appErrorf(LocalizeError("TransientImport", TEXT("Core")), It->GetFullName());
+        }
+    }
+
+    for (TObjectIterator<UObject> It; It; ++It)
+    {
+        if ( It->GetFlags() & (RF_TagExp | RF_TagImp) )
+        {
+            It->Name.SetFlags(RF_LoadContextFlags | RF_TagExp);
+
+            if (It->GetOuter())
+                It->GetOuter()->Name.SetFlags(RF_LoadContextFlags | RF_TagExp);
+
+            if (It->GetFlags() & RF_TagImp)
+            {
+                It->GetClass()->Name.SetFlags(RF_LoadContextFlags | RF_TagExp);
+
+                check(It->GetClass()->GetOuter());
+
+                It->GetClass()->GetOuter()->Name.SetFlags(RF_LoadContextFlags | RF_TagExp);
+
+                if ( !(It->GetFlags() & RF_Public) )
+                    appThrowf(LocalizeError("FailedSavePrivate", TEXT("Core")), Filename, It->GetFullName());
+            }
+            else
+            {
+                debugfSlow(NAME_DevSave, TEXT("Saving %s"), It->GetFullName());
+            }
+        }
+    }
+
+    if (Conform)
+    {
+        debugf(TEXT("Conformal save, relative to: %s, Generation %i"), *(Conform->Filename), Conform->Summary.Generations.Num() + 1);
+
+        ULSave->Summary.Guid = Conform->Summary.Guid;
+        ULSave->Summary.Generations = Conform->Summary.Generations;
+    }
+    else
+    {
+        ULSave->Summary.Guid = appCreateGuid();
+        ULSave->Summary.Generations.Empty(); //CHECKIT! Originally it's copy of empty array
+    }
+
+    new(ULSave->Summary.Generations) FGenerationInfo(0, 0);
+
+    (*ULSave) << ULSave->Summary;
+    ULSave->Summary.NameOffset = ULSave->Tell();
+
+    for (INT i = 0; i < FName::GetMaxNames(); ++i)
+    {
+        FNameEntry *N = FName::GetEntry(i);
+        if (N && (N->Flags & RF_TagExp))
+            new(ULSave->NameMap) FName((EName)i);
+    }
+
+    GTempSave = ULSave;
+
+    if (Conform)
+    {
+        for (INT i = 0; i < Conform->NameMap.Num(); ++i)
+        {
+            INT jj = INDEX_NONE;
+            for(int j = 0; j < ULSave->NameMap.Num(); ++j)
+            {
+                if ( ULSave->NameMap(j) == Conform->NameMap(i) )
+                {
+                    jj = j;
+                    break;
+                }
+            }
+
+            if (Conform->NameMap(i) != NAME_None && jj != INDEX_NONE)
+            {
+                FName tmp = ULSave->NameMap(i);
+                ULSave->NameMap(i) = ULSave->NameMap(jj);
+                ULSave->NameMap(jj) = tmp;
+            }
+            else
+            {
+                new(ULSave->NameMap) FName(ULSave->NameMap(i));
+            }
+        }
+    }
+
+    appQsort( &ULSave->NameMap( Conform->NameMap.Num() ), ULSave->NameMap.Num() - Conform->NameMap.Num(), sizeof(FName), LinkerNameSort);
+
+    ULSave->Summary.NameCount = ULSave->NameMap.Num();
+    for ( INT i = 0; i < ULSave->NameMap.Num(); ++i )
+    {
+        (*ULSave) << ULSave->NameMap(i);
+        ULSave->NameIndices( ULSave->NameMap(i).GetIndex() ) = i;
+    }
+
+    for (TObjectIterator<UObject> It; It; ++It)
+    {
+        if ( It->GetFlags() & RF_TagImp )
+            new(ULSave->ImportMap)FObjectImport(*It);
+    }
+
+    ULSave->Summary.ImportCount = ULSave->ImportMap.Num();
+
+    GTempSave = ULSave;
+    appQsort(ULSave->ImportMap.GetData(), ULSave->ImportMap.Num(), sizeof(FObjectImport), LinkerImportSort);
+
+    for (TObjectIterator<UObject> It; It; ++It)
+    {
+        if ( It->GetFlags() & RF_TagExp )
+            new(ULSave->ExportMap)FObjectExport(*It);
+    }
+
+    if (Conform)
+    {
+        TArray<FObjectExport> ExpArr (ULSave->ExportMap);
+        ULSave->ExportMap.Empty();
+
+        TArray<UBOOL> ExpB;
+        ExpB.AddZeroed(ExpArr.Num());
+
+        TMap<FString,INT> ExpMap;
+
+        for ( INT i = 0; i < ExpArr.Num(); ++i )
+            ExpMap.Set( ExpArr(i)._Object->GetFullName(), i );
+
+        for ( INT i = 0; i < Conform->ExportMap.Num(); ++i )
+        {
+            INT *PVal = ExpMap.Find( Conform->GetExportFullName( i, ULSave->LinkerRoot->GetPathName() ) );
+
+            if (PVal)
+            {
+                ULSave->ExportMap( ULSave->ExportMap.Add() ) = ExpArr(*PVal);
+                check( ULSave->ExportMap.Last()._Object == ExpArr(*PVal)._Object );
+
+                ExpB(*PVal) = true;
+            }
+            else
+                new(ULSave->ExportMap)FObjectExport(NULL);
+        }
+
+        for ( INT i = 0; i < ExpB.Num(); ++i )
+        {
+            if (!ExpB(i))
+                ULSave->ExportMap( ULSave->ExportMap.Add() ) = ExpArr(i);
+        }
+
+        appQsort( &ULSave->ExportMap(Conform->ExportMap.Num()), ULSave->ExportMap.Num() - Conform->ExportMap.Num(), sizeof(FObjectExport), LinkerExportSort);
+    }
+    else
+        appQsort(ULSave->ExportMap.GetData(), ULSave->ExportMap.Num(), sizeof(FObjectExport), LinkerExportSort);
+
+    ULSave->Summary.ExportCount = ULSave->ExportMap.Num();
+
+    for ( INT i = 0; i < ULSave->ExportMap.Num(); ++i )
+    {
+        UObject *O = ULSave->ExportMap(i)._Object;
+        if ( O )
+            ULSave->ObjectIndices( O->GetIndex() ) = 1 + i;
+    }
+
+    for ( INT i = 0; i < ULSave->ImportMap.Num(); ++i )
+    {
+        UObject *O = ULSave->ImportMap(i).XObject;
+        if ( O )
+            ULSave->ObjectIndices( O->GetIndex() ) = -1 - i;
+    }
+
+    for ( INT i = 0; i < ULSave->ExportMap.Num(); ++i )
+    {
+        FObjectExport &Export = ULSave->ExportMap(i);
+        if ( Export._Object )
+        {
+            if (Export._Object->IsA(UClass::StaticClass()) )
+            {
+                Export.ClassIndex = ULSave->ObjectIndices( Export._Object->GetClass()->GetIndex() );
+                check(Export.ClassIndex != 0);
+            }
+
+            UStruct *S = Cast<UStruct>(Export._Object);
+            if (S)
+            {
+                Export.SuperIndex = ULSave->ObjectIndices(S->GetIndex());
+                check(Export.SuperIndex != 0);
+            }
+
+            if ( Export._Object->GetOuter() != InOuter )
+            {
+                check( Export._Object->GetOuter()->IsIn(InOuter) );
+
+                Export.PackageIndex = ULSave->ObjectIndices( Export._Object->GetOuter()->GetIndex() );
+                check(Export.PackageIndex != 0);
+            }
+
+            Export.SerialOffset = ULSave->Tell();
+            Export._Object->Serialize( *ULSave );
+            Export.SerialSize = ULSave->Tell() - Export.SerialOffset;
+        }
+    }
+
+    ULSave->Summary.ImportOffset = ULSave->Tell();
+
+    for ( INT i = 0; i < ULSave->ImportMap.Num(); ++i )
+    {
+        FObjectImport &Import = ULSave->ImportMap(i);
+        if ( Import.XObject->GetOuter() )
+        {
+            check( !Import.XObject->GetOuter()->IsIn(InOuter) );
+
+            Import.PackageIndex = ULSave->ObjectIndices(Import.XObject->GetOuter()->GetIndex());
+
+            check( Import.PackageIndex < 0 );
+        }
+        (*ULSave) << Import;
+    }
+
+    ULSave->Summary.ExportOffset = ULSave->Tell();
+
+    for ( INT i = 0; i < ULSave->ExportMap.Num(); ++i )
+    {
+        FObjectExport &Export = ULSave->ExportMap(i);
+        (*ULSave) << Export;
+    }
+
+    GWarn->StatusUpdatef( 0, 0, TEXT("%s"), LocalizeProgress("Closing", TEXT("Core")) );
+
+    ULSave->Summary.Generations.Last().ExportCount = ULSave->Summary.ExportCount;
+    ULSave->Summary.Generations.Last().NameCount = ULSave->Summary.NameCount;
+
+    ULSave->Seek(0);
+
+    (*ULSave) << ULSave->Summary;
+
+    debugf(NAME_Log, TEXT("Save=%f"), (appCycles() - TStart - 34) * GSecondsPerCycle * 1000.0);
+
+    debugf(NAME_Log, TEXT("Moving '%s' to '%s'"), TempFilename, Filename);
+
+    if ( !GFileManager->Move(Filename, TempFilename) )
+    {
+        GFileManager->Delete(TempFilename);
+        GWarn->Logf(LocalizeError("SaveWarning", TEXT("Core")), Filename);
+        return false;
+    }
+
+    return true;
+    unguard;
+}
+
+
+
+
+class FArchiveTagUsed : public FArchive
+{
+public:
+    FArchiveTagUsed()
+    {
+        GGarbageRefCount = 0;
+        Context = NULL;
+
+        for (TObjectIterator<UObject> It; It; ++It)
+            It->SetFlags( RF_TagGarbage | RF_Unreachable );
+
+        for (INT i = 0; i < FName::GetMaxNames(); ++i)
+            FName::GetEntry(i)->Flags |= RF_Unreachable;
+    }
+
+    FArchive& operator<<( UObject*& Object )
+    {
+        guard(FArchiveTagUsed<<UObject);
+
+        ++GGarbageRefCount;
+
+        if ( Object )
+        {
+            if ( Object->GetFlags() & RF_EliminateObject )
+            {
+                Object = NULL;
+            }
+            else if ( Object->GetFlags() & RF_Unreachable )
+            {
+                Object->ClearFlags(RF_DebugSerialize | RF_Unreachable);
+
+                if ( Object->GetFlags() & RF_TagGarbage )
+                {
+                    UObject* tmp = Context;
+                    Context = Object;
+
+                    Object->Serialize( *this );
+
+                    if ( !(Object->GetFlags() & RF_DebugSerialize) )
+                        GError->Logf(TEXT("%s failed to route Serialize"), Object->GetFullName());
+
+                    Context = tmp;
+                }
+                else
+                {
+                    if ( Context )
+                        debugfSlow(NAME_Log, TEXT("%s is referenced by %s"), Object->GetFullName(), Context->GetFullName());
+                    else
+                        debugfSlow(NAME_Log, TEXT("%s is referenced by %s"), Object->GetFullName(), NULL);
+                }
+            }
+        }
+
+        return *this;
+        unguard;
+    };
+
+    FArchive& operator<<( FName& N )
+    {
+        guard(FArchiveTagUsed<<FName);
+
+        N.ClearFlags(RF_Unreachable);
+
+        return *this;
+        unguard;
+    };
+
+protected:
+    UObject*		Context;
+};
+
+
+
+void UObject::CollectGarbage( DWORD KeepFlags )
+{
+    guard(UObject::CollectGarbage);
+
+    debugf(NAME_Log, TEXT("Collecting garbage"));
+
+    FArchiveTagUsed Garbager;
+    SerializeRootSet(Garbager, KeepFlags, RF_TagGarbage);
+    PurgeGarbage();
+
+    unguard;
+}
+
+
+
+void UObject::SerializeRootSet( FArchive& Ar, DWORD KeepFlags, DWORD RequiredFlags )
+{
+    guard(UObject::SerializeRootSet);
+
+    Ar << GObjRoot;
+
+    for (TObjectIterator<UObject> It; It; ++It)
+    {
+        if ( (It->GetFlags() & KeepFlags) && (It->GetFlags() & RequiredFlags) == RequiredFlags)
+        {
+            UObject *Obj = *It;
+            Ar << Obj;
+        }
+    }
+
+    unguard;
+}
+
+
+
+UBOOL UObject::IsReferenced( UObject*& Res, DWORD KeepFlags, UBOOL IgnoreReference )
+{
+    guard(UObject::IsReferenced);
+
+    UObject* Obj = Res;
+
+    if ( IgnoreReference )
+        Res = NULL;
+
+    FArchiveTagUsed Refs;
+
+    Obj->ClearFlags(RF_TagGarbage);
+
+    SerializeRootSet(Refs, KeepFlags, RF_TagGarbage);
+
+    Res = Obj;
+
+    return (Obj->GetFlags() & RF_Unreachable) == 0;
+
+    unguard;
+}
+
+
+UBOOL UObject::AttemptDelete( UObject*& Res, DWORD KeepFlags, UBOOL IgnoreReference )
+{
+    guard(UObject::AttemptDelete);
+
+    if ( (Res->GetFlags() & RF_Native) || IsReferenced(Res, KeepFlags, IgnoreReference) )
+        return false;
+
+    PurgeGarbage();
+    return true;
+
+    unguard;
+}
+
+
+void UObject::BeginLoad()
+{
+    guard(UObject::BeginLoad);
+
+    if ( GObjBeginLoadCount++ == 0 )
+    {
+        check(GObjLoaded.Num() == 0);
+        check(!GAutoRegister);
+
+        for (INT i = 0; i < GObjLoaders.Num(); ++i )
+        {
+            check( GetLoader(i)->Success );
+        }
+    }
+
+    unguard;
+}
+
+
+void UObject::EndLoad()
+{
+    guard(UObject::EndLoad);
+
+    check(GObjBeginLoadCount > 0);
+
+    if ( --GObjBeginLoadCount == 0 )
+    {
+        debugfSlow(NAME_DevLoad, TEXT("Loading objects..."));
+
+        for (INT i = 0; i < GObjLoaded.Num(); ++i )
+        {
+            UObject* Obj= GObjLoaded(i);
+            if ( Obj->GetFlags() & RF_NeedLoad )
+            {
+                check(Obj->GetLinker());
+                Obj->GetLinker()->Preload(Obj);
+            }
+        }
+
+        INT OriginalNum = GObjLoaded.Num();
+
+        for (INT i = 0; i < GObjLoaded.Num(); ++i )
+            GObjLoaded(i)->ConditionalPostLoad();
+
+        check(GObjLoaded.Num() == OriginalNum);
+
+        GObjLoaded.Empty();
+
+        if ( GImportCount )
+        {
+            for (INT i = 0; i < GObjLoaders.Num(); ++i )
+            {
+                ULinkerLoad *Loader = GetLoader(i);
+
+                for (INT j = 0; j < Loader->ImportMap.Num(); ++j)
+                {
+                    FObjectImport& Import = Loader->ImportMap(j);
+                    if (Import.XObject && (Import.XObject->GetFlags() & RF_Native) )
+                        Import.XObject = NULL;
+                }
+            }
+        }
+
+        GImportCount = 0;
+    }
+
+    unguard;
+}
+
+
+void UObject::InitProperties( BYTE* Data, INT DataCount, UClass* DefaultsClass, BYTE* Defaults, INT DefaultsCount )
+{
+    guard(UObject::InitProperties);
+
+    check(DataCount >= sizeof(UObject));
+
+    const INT OSZ = sizeof(UObject);
+    INT Count = OSZ;
+
+    if ( !Defaults && DefaultsClass && DefaultsClass->Defaults.Num())
+    {
+        DefaultsCount = DefaultsClass->Defaults.Num();
+        Defaults = &DefaultsClass->Defaults(0);
+    }
+
+    if (Defaults)
+    {
+        appMemcpy(&Data[OSZ], &Defaults[OSZ], DefaultsCount - OSZ);
+        Count = DefaultsCount;
+    }
+
+    if ( Count < DataCount )
+        appMemset(&Data[Count], 0, DataCount - Count);
+
+    if ( DefaultsClass )
+    {
+        for (UProperty* prop = DefaultsClass->ConstructorLink; prop; prop = prop->ConstructorLinkNext )
+        {
+            if ( prop->Offset < DefaultsCount )
+            {
+                memset(&Data[ prop->Offset ], 0, prop->ArrayDim * prop->ElementSize);
+                prop->CopyCompleteValue(&Data[ prop->Offset ], &Defaults[ prop->Offset ]);
+            }
+        }
+    }
+
+    unguard;
+}
+
+
+void UObject::ExitProperties( BYTE* Data, UClass* Class )
+{
+    guard(UObject::ExitProperties);
+
+    for (UProperty* prop = Class->ConstructorLink; prop; prop = prop->ConstructorLinkNext )
+    {
+        prop->DestroyValue(&Data[ prop->Offset ]);
+    }
+
+    unguard;
+}
+
+
+void UObject::ResetLoaders( UObject* InOuter, UBOOL DynamicOnly, UBOOL ForceLazyLoad )
+{
+    guard(UObject::ResetLoaders);
+
+    for (INT i = GObjLoaders.Num() - 1; i >= 0; --i )
+    {
+        ULinkerLoad *Loader = CastChecked<ULinkerLoad>( GObjLoaders(i) );
+
+        if ( !InOuter || Loader->LinkerRoot == InOuter )
+        {
+            if ( DynamicOnly )
+            {
+                for (INT j = 0; j < Loader->ExportMap.Num(); ++j )
+                {
+                    UObject* Obj = Loader->ExportMap(j)._Object;
+                    if ( Obj )
+                    {
+                        if ( Obj->GetClass()->ClassFlags >= 0 )
+                            Loader->DetachExport(j);
+                    }
+                }
+            }
+            else
+            {
+                if ( ForceLazyLoad )
+                    Loader->DetachAllLazyLoaders(true);
+
+                if ( Loader )
+                    delete Loader;
+            }
+        }
+    }
+
+    unguard;
+}
+
+
+UPackage* UObject::CreatePackage( UObject* InOuter, const TCHAR* PkgName )
+{
+    guard(UObject::CreatePackage);
+
+    ResolveName(InOuter, PkgName, true, false);
+
+    UPackage *Obj = FindObject<UPackage>(InOuter, PkgName);
+    if ( !Obj )
+        Obj = new(InOuter, PkgName, RF_Public) UPackage();
+
+    return Obj;
+    unguard;
+}
+
+
+ULinkerLoad* UObject::GetPackageLinker( UObject* InOuter, const TCHAR* InFilename, DWORD LoadFlags, UPackageMap* Sandbox, FGuid* CompatibleGuid )
+{
+    guard(UObject::GetPackageLinker);
+
+    check(GObjBeginLoadCount);
+
+    ULinkerLoad *Result = NULL;
+
+    if ( InOuter )
+    {
+        for (INT i = 0; i < GObjLoaders.Num() && !Result; ++i )
+        {
+            if ( GetLoader(i)->LinkerRoot == InOuter )
+                Result = GetLoader(i);
+        }
+    }
+
+    TCHAR NewFilename[256] = TEXT("");
+
+    if (Result)
+    {
+        appStrcpy(NewFilename, TEXT(""));
+    }
+    else if (InFilename)
+    {
+        if ( !appFindPackageFile(InFilename, CompatibleGuid, NewFilename) )
+            appThrowf(LocalizeError("FileNotFound", TEXT("Core")), InFilename);
+
+        TCHAR Tmp[256];
+        appStrcpy(Tmp, NewFilename);
+
+        TCHAR *p = Tmp;
+
+        while ( 1 )
+        {
+            if ( appStrstr(p, TEXT("\\")) )
+                p = appStrstr(p, TEXT("\\")) + 1;
+            else if ( appStrstr(p, TEXT("/")) )
+                p = appStrstr(p, TEXT("/")) + 1;
+            else if ( appStrstr(p, TEXT(":")) )
+                p = appStrstr(p, TEXT(":")) + 1;
+            else
+                break;
+        }
+
+        if ( appStrstr(p, ".") )
+            *appStrstr(p, ".") = 0;
+
+        UPackage *Pkg = CreatePackage(NULL, p);
+        if ( InOuter )
+        {
+            if ( InOuter != Pkg )
+            {
+                debugf(TEXT("New File, Existing Package (%s, %s)"), InOuter->GetFullName(), Pkg->GetFullName());
+                ResetLoaders(InOuter, false, true);
+            }
+        }
+        else
+        {
+            if ( !Pkg )
+                appThrowf(LocalizeError("FilenameToPackage", TEXT("Core")), InFilename);
+
+            InOuter = Pkg;
+
+            for (INT i = 0; i < GObjLoaders.Num() && !Result; ++i )
+            {
+                if ( GetLoader(i)->LinkerRoot == Pkg )
+                    Result = GetLoader(i);
+            }
+        }
+    }
+    else
+    {
+        if ( !InOuter )
+            appThrowf(LocalizeError("PackageResolveFailed", TEXT("Core")));
+
+        if ( !appFindPackageFile(InOuter->GetName(), CompatibleGuid, NewFilename) )
+        {
+            if ( (LoadFlags & LOAD_AllowDll) )
+            {
+                UPackage *Pkg = Cast<UPackage>(InOuter);
+                if (Pkg && Pkg->DllHandle)
+                    return NULL;
+            }
+
+            appThrowf(LocalizeError("PackageNotFound", TEXT("Core")), InOuter->GetName());
+            return NULL;
+        }
+    }
+
+    if ( !Result )
+        Result = new ULinkerLoad(InOuter, NewFilename, LoadFlags);
+
+    if ( CompatibleGuid && Result->Summary.Guid != *CompatibleGuid )
+        appThrowf(LocalizeError("PackageVersion", TEXT("Core")), InOuter->GetName());
+
+    if ( Sandbox && InOuter && !Sandbox->SupportsPackage(InOuter))
+    {
+        debugf(LocalizeError("Sandbox", TEXT("Core")), InOuter->GetName());
+        return NULL;
+    }
+
+    return Result;
+
+    unguard;
+}
+
+
+
+void UObject::StaticShutdownAfterError()
+{
+    guard(UObject::StaticShutdownAfterError);
+
+    static UBOOL Shutdown = false;
+
+    if ( GObjInitialized && !Shutdown )
+    {
+        Shutdown = true;
+
+        debugf(NAME_Exit, TEXT("Executing UObject::StaticShutdownAfterError"));
+
+        for (INT i = 0; i < GObjObjects.Num(); ++i )
+        {
+            UObject *Obj = GObjObjects(i);
+            if ( Obj )
+                Obj->ConditionalShutdownAfterError();
+        }
+    }
+    unguard;
+}
+
+
+UObject* UObject::GetIndexedObject( INT Index )
+{
+    guard(UObject::GetIndexedObject);
+
+    if (Index >= 0 && Index < GObjObjects.Num())
+        return GObjObjects(Index);
+    return NULL;
+    unguard;
+}
+
+
+void UObject::GlobalSetProperty( const TCHAR* Value, UClass* Class, UProperty* Property, INT Offset, UBOOL Immediate )
+{
+    guard(UObject::GlobalSetProperty);
+    if ( Immediate )
+    {
+        for (TObjectIterator<UObject> It; It; ++It)
+        {
+            if ( It->IsA(Class) )
+            {
+                Property->ImportText(Value, (BYTE *)(*It) + Offset, PPF_Localized);
+                It->PostEditChange();
+            }
+        }
+    }
+
+    Property->ImportText(Value, &Class->Defaults(Offset), PPF_Localized);
+    Class->GetDefaultObject()->SaveConfig();
+    unguard;
+}
+
+
+void UObject::ExportProperties( FOutputDevice& Out, UClass* ObjectClass, BYTE* Object, INT Indent, UClass* DiffClass, BYTE* Diff )
+{
+    guard(UObject::ExportProperties);
+
+    check(ObjectClass != NULL);
+
+    for (TFieldIterator<UProperty> It(ObjectClass); It; ++It)
+    {
+        if (It->Port())
+        {
+            for (INT i = 0; i < It->ArrayDim; ++i)
+            {
+                BYTE *D = NULL;
+                if ( DiffClass && DiffClass->IsChildOf( It.GetStruct() ) )
+                    D = Diff;
+
+                TCHAR Value[4096];
+                if ( It->ExportText(i, Value, Object, D, LOAD_NoWarn) )
+                {
+                    if ( It->IsA(UObjectProperty::StaticClass()) && (It->PropertyFlags & CPF_ExportObject))
+                    {
+                        UObject *Obj = (UObject *)&Object[It->Offset + i * It->ElementSize];
+                        if ( Obj )
+                        {
+                            if ( !(Obj->GetFlags() & RF_TagImp) )
+                            {
+                                UExporter::ExportToOutputDevice(Obj, NULL, Out, TEXT("T3D"), Indent + 1);
+                                Obj->SetFlags(RF_TagImp);
+                            }
+                        }
+                    }
+
+                    if ( It->ArrayDim != 1 )
+                        Out.Logf(TEXT("%s %s(%i)=%s\r\n"), appSpc(Indent), It->GetName(), i, Value);
+                    else
+                        Out.Logf(TEXT("%s %s=%s\r\n"), appSpc(Indent), It->GetName(), Value);
+                }
+            }
+        }
+    }
+
+    unguard;
+}
+
+
+
+void UObject::ResetConfig( UClass* Class )
+{
+    guard(UObject::ResetConfig);
+
+    const TCHAR *Filename = NULL;
+
+    if (Class->ClassConfigName == NAME_System)
+        Filename = TEXT("Default.ini");
+    else if (Class->ClassConfigName == NAME_User)
+        Filename = TEXT("DefUser.ini");
+    else
+        return;
+
+    TCHAR Buffer[0x7FFF];
+    if ( GConfig->GetSection(Class->GetPathName(), Buffer, 0x7FFF, Filename) )
+    {
+        TCHAR *ln = &Buffer[0];
+
+        while(*ln)
+        {
+            INT lnSz = appStrlen(ln);
+            TCHAR *E = appStrstr(ln, TEXT("="));
+            if ( E )
+            {
+                *E = 0;
+                GConfig->SetString(Class->GetPathName(), ln, E + 1, *Class->ClassConfigName);
+            }
+
+            ln += lnSz + 1;
+        }
+    }
+
+    for (TObjectIterator<UClass> It; It; ++It)
+    {
+        if ( It->IsChildOf(Class) )
+            It->GetDefaultObject()->LoadConfig(true);
+    }
+
+    for (TObjectIterator<UObject> It; It; ++It)
+    {
+        if ( It->IsA(Class) )
+        {
+            It->LoadConfig(true);
+            It->PostEditChange();
+        }
+    }
+
+    unguard;
+}
+
+
+
+void UObject::GetRegistryObjects( TArray<FRegistryObjectInfo>& Results, UClass* Class, UClass* MetaClass, UBOOL ForceRefresh )
+{
+    guard(UObject::GetRegistryObjects);
+
+    check(Class);
+    check(Class != UClass::StaticClass() || MetaClass);
+
+    CacheDrivers(ForceRefresh);
+
+    const TCHAR *ClassName = Class->GetName();
+    const TCHAR *MetaName = TEXT("");
+
+    if (MetaClass)
+        MetaName = MetaClass->GetPathName();
+
+    for(int i = 0; i < GObjDrivers.Num(); ++i)
+    {
+        if ( !appStricmp( *GObjDrivers(i).Class, ClassName) && !appStricmp( *GObjDrivers(i).MetaClass, MetaName) )
+            *(new(Results)FRegistryObjectInfo) = GObjDrivers(i);
+    }
+
+    unguard;
+}
+
+
+
+void UObject::GetPreferences( TArray<FPreferencesInfo>& Results, const TCHAR* Category, UBOOL ForceRefresh )
+{
+    guard(UObject::GetPreferences);
+
+    CacheDrivers(ForceRefresh);
+    Results.Empty();
+
+    for(int i = 0; i < GObjPreferences.Num(); ++i)
+    {
+        if ( !appStricmp( *GObjPreferences(i).ParentCaption, Category) )
+            *(new(Results)FPreferencesInfo) = GObjPreferences(i);
+    }
+
+    unguard;
+}
+
+
+UBOOL UObject::GetInitialized()
+{
+    guard(UObject::GetInitialized);
+
+    return GObjInitialized;
+
+    unguard;
+}
+
+
+UPackage* UObject::GetTransientPackage()
+{
+    guard(UObject::GetTransientPackage);
+
+    return GObjTransientPkg;
+
+    unguard;
+}
+
+
+void UObject::VerifyLinker( ULinkerLoad* Linker )
+{
+    guard(UObject::VerifyLinker);
+
+    Linker->Verify();
+
+    unguard;
+}
+
+
+void UObject::ProcessRegistrants()
+{
+    guard(UObject::ProcessRegistrants);
+
+    if ( GObjRegisterCount++ == 0 )
+    {
+        while ( GAutoRegister )
+        {
+            GObjRegistrants( GObjRegistrants.Add() ) = GAutoRegister;
+            GAutoRegister = (UObject *)GAutoRegister->_LinkerIndex;
+        }
+
+        for (INT i = 0; i < GObjRegistrants.Num(); ++i )
+            GObjRegistrants(i)->ConditionalRegister();
+
+        GObjRegistrants.Empty();
+
+        check(!GAutoRegister);
+    }
+    --GObjRegisterCount;
+
+    unguard;
+}
+
+
+void UObject::BindPackage( UPackage* Pkg )
+{
+    guard(UObject::BindPackage);
+
+    if ( !Pkg->DllHandle && !Pkg->Outer && !Pkg->AttemptedBind )
+    {
+        TCHAR PathName[256];
+        appSprintf(PathName, TEXT("%s%s"), appBaseDir(), Pkg->GetName());
+
+        GObjNoRegister = false;
+
+        Pkg->AttemptedBind = 1;
+        Pkg->DllHandle = appGetDllHandle(PathName);
+
+        GObjNoRegister = true;
+
+        if ( Pkg->DllHandle )
+        {
+            debugf(NAME_Log, TEXT("Bound to %s%s"), Pkg->GetName(), DLLEXT);
+            ProcessRegistrants();
+        }
+    }
+
+    unguard;
+}
+
+
+const TCHAR* UObject::GetLanguage()
+{
+    guard(UObject::GetLanguage);
+
+    return GLanguage;
+
+    unguard;
+}
+
+
+void UObject::SetLanguage( const TCHAR* LanguageExt )
+{
+    guard(UObject::SetLanguage);
+
+    if ( appStricmp(LanguageExt, GLanguage) )
+    {
+        appStrcpy(GLanguage, LanguageExt);
+        appStrcpy(GNone, LocalizeGeneral(TEXT("None"), TEXT("Core")));
+        appStrcpy(GTrue, LocalizeGeneral(TEXT("True"), TEXT("Core")));
+        appStrcpy(GFalse, LocalizeGeneral(TEXT("False"), TEXT("Core")));
+        appStrcpy(GYes, LocalizeGeneral(TEXT("Yes"), TEXT("Core")));
+        appStrcpy(GNo, LocalizeGeneral(TEXT("No"), TEXT("Core")));
+
+
+        for (TObjectIterator<UObject> It; It; ++It)
+            It->LanguageChange();
+    }
+
+    unguard;
+}
+
+
