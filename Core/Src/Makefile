@@ -14,7 +14,7 @@ LIB =
 LDFLAGS = -m32 -shared
 
 INC_RELEASE = $(INC)
-CFLAGS_RELEASE = $(CXX) $(CFLAGS) -O0 
+CFLAGS_RELEASE = $(CXX) $(CFLAGS) -O1
 RESINC_RELEASE = $(RESINC)
 RCFLAGS_RELEASE = $(RCFLAGS)
 LIBDIR_RELEASE = $(LIBDIR)
@@ -24,7 +24,7 @@ OBJDIR_RELEASE = obj/Release
 DEP_RELEASE = 
 OUT_RELEASE = Core.so
 
-OBJ_RELEASE = $(OBJDIR_RELEASE)/UnObj.o $(OBJDIR_RELEASE)/UnCorSc.o
+OBJ_RELEASE = $(OBJDIR_RELEASE)/UnObj.o $(OBJDIR_RELEASE)/UnCorSc.o $(OBJDIR_RELEASE)/UnName.o $(OBJDIR_RELEASE)/UnLinker.o
 
 all: release
 
@@ -45,6 +45,12 @@ $(OBJDIR_RELEASE)/UnObj.o: UnObj.cpp
 
 $(OBJDIR_RELEASE)/UnCorSc.o: UnCorSc.cpp
 	$(CFLAGS_RELEASE) $(INC_RELEASE) -c UnCorSc.cpp -o $(OBJDIR_RELEASE)/UnCorSc.o
+
+$(OBJDIR_RELEASE)/UnName.o: UnName.cpp
+	$(CFLAGS_RELEASE) $(INC_RELEASE) -c UnName.cpp -o $(OBJDIR_RELEASE)/UnName.o
+
+$(OBJDIR_RELEASE)/UnLinker.o: UnLinker.cpp
+	$(CFLAGS_RELEASE) $(INC_RELEASE) -c UnLinker.cpp -o $(OBJDIR_RELEASE)/UnLinker.o
 
 clean_release: 
 	rm -f $(OBJ_RELEASE) $(OUT_RELEASE)

@@ -2786,7 +2786,7 @@ UBOOL UObject::SavePackage( UObject* InOuter, UObject* Base, DWORD TopLevelFlags
     ULSave->Summary.NameCount = ULSave->NameMap.Num();
     for ( INT i = 0; i < ULSave->NameMap.Num(); ++i )
     {
-        (*ULSave) << ULSave->NameMap(i);
+        (*ULSave) << *FName::GetEntry( ULSave->NameMap(i).GetIndex() );
         ULSave->NameIndices( ULSave->NameMap(i).GetIndex() ) = i;
     }
 
